@@ -1,0 +1,2 @@
+# PHP_Laravel12_Migration_Generator
+Laravel Migration Generator
