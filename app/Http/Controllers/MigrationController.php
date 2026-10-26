@@ -2,19 +2,30 @@
 
 namespace App\Http\Controllers;
 
+use App\Services\MigrationGeneratorService;
 use Illuminate\Http\Request;
-use Illuminate\Support\Facades\Artisan;
+use Illuminate\Pagination\LengthAwarePaginator;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Schema;
-use Illuminate\Pagination\LengthAwarePaginator;
+use Illuminate\Support\Str;
 
 class MigrationController extends Controller
 {
+    protected MigrationGeneratorService $generatorService;
+
+    public function __construct(MigrationGeneratorService $generatorService)
+    {
+        $this->generatorService = $generatorService;
+    }
+
     public function index(Request $request)
     {
         $search = $request->search;
-
         $migrationPath = database_path('migrations');
+
+        if (!File::exists($migrationPath)) {
+            File::makeDirectory($migrationPath, 0755, true);
+        }
 
         $files = collect(File::files($migrationPath))
             ->sortByDesc(function ($file) {
@@ -36,12 +47,12 @@ class MigrationController extends Controller
             'today' => $files->filter(function ($file) use ($today) {
                 return str_contains($file->getFilename(), $today);
             })->count(),
-            'tables' => $files->count(),
+            'tables' => count($this->generatorService->getKnownTables()),
             'latest' => optional($files->first())->getFilename(),
         ];
 
         // Pagination
-        $perPage = 3;
+        $perPage = 8;
         $page = LengthAwarePaginator::resolveCurrentPage();
 
         $currentItems = $files
@@ -59,72 +70,177 @@ class MigrationController extends Controller
             ]
         );
 
+        $columnTypes = MigrationGeneratorService::COLUMN_TYPES;
+        $knownTables = $this->generatorService->getKnownTables();
+        $erdData = $this->generatorService->parseMigrationsForErd();
+
         return view('home', compact(
             'migrations',
             'stats',
-            'search'
+            'search',
+            'columnTypes',
+            'knownTables',
+            'erdData'
         ));
     }
 
     public function generate(Request $request)
     {
         $request->validate([
-            'table' => 'required|string|alpha_dash',
-            'fields' => 'required|string',
+            'table' => 'required|string|regex:/^[a-zA-Z0-9_]+$/',
+            'fields' => 'required',
+            'migration_type' => 'nullable|in:create,alter',
         ]);
 
         $table = strtolower(trim($request->table));
+        $migrationType = $request->input('migration_type', 'create');
 
-        if (Schema::hasTable($table)) {
-            return back()->with('error', "Table '{$table}' already exists.");
+        $fields = $this->generatorService->parseFields($request->fields);
+
+        if (empty($fields)) {
+            return back()->withInput()->with('error', 'Please specify at least one column for the migration.');
         }
 
-        $columns = $this->buildColumns($request->fields);
-
-        if ($request->has('preview')) {
-
-            $preview = $this->generatePreview($table, $columns);
+        // If preview requested
+        if ($request->has('preview') || $request->preview == '1') {
+            $previewCode = $this->generatorService->generateMigrationCode($table, $fields, $migrationType);
+            $previewSql = $this->generatorService->generateSqlPreview($table, $fields, $migrationType);
+            $rawShorthand = $this->generatorService->fieldsToRawString($fields);
 
             return back()
                 ->withInput()
-                ->with('preview', $preview);
+                ->with('preview_code', $previewCode)
+                ->with('preview_sql', $previewSql)
+                ->with('raw_shorthand', $rawShorthand);
         }
 
-        Artisan::call('make:migration', [
-            'name' => "create_{$table}_table",
-            '--create' => $table,
-        ]);
-
-        $migrationPath = database_path('migrations');
-
-        $files = collect(File::files($migrationPath))
-            ->sortByDesc(function ($file) {
-                return $file->getMTime();
-            });
-
-        $migration = $files->first(function ($file) use ($table) {
-            return str_contains(
-                $file->getFilename(),
-                "create_{$table}_table"
-            );
-        });
-
-        if (!$migration) {
-            return back()->with('error', 'Migration not found.');
+        // Check if table already exists in create mode
+        if ($migrationType === 'create') {
+            try {
+                if (Schema::hasTable($table)) {
+                    return back()->withInput()->with('error', "Table '{$table}' already exists in the database. Use 'Alter Existing Table' mode to add or modify columns.");
+                }
+            } catch (\Throwable $e) {
+                // Ignore DB check error if offline
+            }
         }
 
-        $content = File::get($migration->getPathname());
+        // Format migration filename
+        $timestamp = date('Y_m_d_His');
+        if ($migrationType === 'create') {
+            $fileName = "{$timestamp}_create_{$table}_table.php";
+        } else {
+            $suffix = Str::lower(Str::random(4));
+            $fileName = "{$timestamp}_alter_{$table}_table_{$suffix}.php";
+        }
 
-        $newContent = str_replace(
-            '$table->id();',
-            '$table->id();' . PHP_EOL . $columns,
-            $content
-        );
+        $migrationPath = database_path('migrations/' . $fileName);
+        $code = $this->generatorService->generateMigrationCode($table, $fields, $migrationType);
 
-        File::put($migration->getPathname(), $newContent);
+        File::put($migrationPath, $code);
 
         return redirect('/')
-            ->with('success', 'Migration generated successfully.');
+            ->with('success', "Migration '{$fileName}' generated successfully!");
+    }
+
+    public function previewSql(Request $request)
+    {
+        $request->validate([
+            'table' => 'required|string',
+            'fields' => 'required',
+            'migration_type' => 'nullable|in:create,alter',
+        ]);
+
+        $table = strtolower(trim($request->table));
+        $migrationType = $request->input('migration_type', 'create');
+        $fields = $this->generatorService->parseFields($request->fields);
+
+        $code = $this->generatorService->generateMigrationCode($table, $fields, $migrationType);
+        $sql = $this->generatorService->generateSqlPreview($table, $fields, $migrationType);
+        $shorthand = $this->generatorService->fieldsToRawString($fields);
+
+        return response()->json([
+            'success' => true,
+            'code' => $code,
+            'sql' => $sql,
+            'shorthand' => $shorthand,
+            'fields_count' => count($fields),
+        ]);
+    }
+
+    public function getCode($file)
+    {
+        $path = database_path('migrations/' . $file);
+
+        if (!File::exists($path)) {
+            return response()->json(['error' => 'Migration file not found.'], 404);
+        }
+
+        $content = File::get($path);
+
+        // Attempt to extract table name and preview SQL
+        $sqlPreview = '-- SQL DDL Preview available during migration execution or pretend mode';
+        if (preg_match("/Schema::(create|table)\(\s*['\"]([^'\"]+)['\"]/i", $content, $match)) {
+            $type = strtolower($match[1]);
+            $table = $match[2];
+            $sqlPreview = "-- Generated schema for table `{$table}` ({$type})\n-- Inspect PHP code editor tab for exact Blueprint operations.";
+        }
+
+        return response()->json([
+            'file' => $file,
+            'code' => $content,
+            'sql' => $sqlPreview,
+            'last_modified' => date('Y-m-d H:i:s', File::lastModified($path)),
+        ]);
+    }
+
+    public function updateCode(Request $request, $file)
+    {
+        $request->validate([
+            'code' => 'required|string',
+        ]);
+
+        $path = database_path('migrations/' . $file);
+
+        if (!File::exists($path)) {
+            return response()->json(['error' => 'Migration file not found.'], 404);
+        }
+
+        File::put($path, $request->code);
+
+        if ($request->wantsJson()) {
+            return response()->json([
+                'success' => true,
+                'message' => "Migration '{$file}' updated successfully!",
+            ]);
+        }
+
+        return back()->with('success', "Migration '{$file}' updated successfully!");
+    }
+
+    public function erd()
+    {
+        $erdData = $this->generatorService->parseMigrationsForErd();
+        return response()->json($erdData);
+    }
+
+    public function exportErd($format = 'mermaid')
+    {
+        $erdData = $this->generatorService->parseMigrationsForErd();
+
+        if ($format === 'json') {
+            return response($erdData['tables'], 200, [
+                'Content-Type' => 'application/json',
+                'Content-Disposition' => 'attachment; filename="database_schema_erd.json"',
+            ]);
+        }
+
+        $markdown = "# Database Schema Entity Relationship Diagram\n\n```mermaid\n" . $erdData['mermaid'] . "```\n";
+
+        return response($markdown, 200, [
+            'Content-Type' => 'text/markdown',
+            'Content-Disposition' => 'attachment; filename="database_schema_erd.md"',
+        ]);
     }
 
     public function download($file)
@@ -212,93 +328,5 @@ class MigrationController extends Controller
             });
 
         return view('trash', compact('files'));
-    }
-    
-
-    private function buildColumns($fieldString)
-    {
-        $columns = '';
-
-        $fields = explode(',', $fieldString);
-
-        foreach ($fields as $field) {
-
-            $field = trim($field);
-
-            if (empty($field)) {
-                continue;
-            }
-
-            $parts = explode(':', $field);
-
-            $name = trim($parts[0]);
-
-            $type = $parts[1] ?? 'string';
-
-            switch ($type) {
-
-                case 'integer':
-                    $columns .= "            \$table->integer('$name');\n";
-                    break;
-
-                case 'bigInteger':
-                    $columns .= "            \$table->bigInteger('$name');\n";
-                    break;
-
-                case 'decimal':
-                    $columns .= "            \$table->decimal('$name',10,2);\n";
-                    break;
-
-                case 'float':
-                    $columns .= "            \$table->float('$name');\n";
-                    break;
-
-                case 'boolean':
-                    $columns .= "            \$table->boolean('$name');\n";
-                    break;
-
-                case 'text':
-                    $columns .= "            \$table->text('$name');\n";
-                    break;
-
-                case 'longText':
-                    $columns .= "            \$table->longText('$name');\n";
-                    break;
-
-                case 'date':
-                    $columns .= "            \$table->date('$name');\n";
-                    break;
-
-                case 'dateTime':
-                    $columns .= "            \$table->dateTime('$name');\n";
-                    break;
-
-                case 'timestamp':
-                    $columns .= "            \$table->timestamp('$name');\n";
-                    break;
-
-                case 'json':
-                    $columns .= "            \$table->json('$name');\n";
-                    break;
-
-                default:
-                    $columns .= "            \$table->string('$name');\n";
-            }
-        }
-
-        return $columns;
-    }
-
-    private function generatePreview($table, $columns)
-    {
-        return
-            "Schema::create('$table', function (Blueprint \$table) {
-
-    \$table->id();
-
-$columns
-    \$table->timestamps();
-
-});";
     }
 }
